@@ -7,6 +7,8 @@ Used by FrankaRobot.start_trajectory_controller() to decouple remote
 policy inference (10 Hz, GPU server) from smooth robot execution (200 Hz, NUC).
 """
 
+from __future__ import annotations  # Python 3.8 compat: defer annotation evaluation
+
 import logging
 import threading
 import time
