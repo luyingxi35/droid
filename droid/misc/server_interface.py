@@ -78,6 +78,15 @@ class ServerInterface:
 
     # ── High-frequency trajectory controller ──────────────────────────────────
 
+    def get_state_history(self, n=100):
+        """Return (timestamps, joints_list, gripper_list) from NUC's HighFreqController.
+
+        Used for UMI-style proprioception interpolation: the GPU server calls this
+        at each 10 Hz tick to get a 200 Hz history of (arm, gripper) states, then
+        interpolates to the camera observation timestamp.
+        """
+        return self.server.get_state_history(int(n))
+
     def start_trajectory_controller(self, frequency=200.0):
         """Start the 200 Hz joint position controller on the NUC server."""
         self.server.start_trajectory_controller(float(frequency))

@@ -192,17 +192,23 @@ class FrankaRobot:
     # ── High-frequency trajectory controller ──────────────────────────────────
 
     def start_trajectory_controller(self, frequency=200.0):
-        """Start the high-frequency joint position controller on the NUC.
+        """Start the high-frequency joint position + state-logging controller.
 
         Must be called AFTER update_joints(..., blocking=False) has been invoked
         at least once to ensure the Polymetis impedance controller is active.
+
+        Passes both self._robot (RobotInterface) and self._gripper (GripperInterface)
+        so the controller can log arm + gripper state at 200 Hz for UMI-style
+        proprioception interpolation on the GPU server.
 
         zerorpc-exposed: called by GPU-server via ServerInterface.
         """
         from droid.franka.trajectory_controller import HighFreqController
         if self._traj_ctrl is not None and self._traj_ctrl.is_alive():
             return  # already running
-        self._traj_ctrl = HighFreqController(self._robot, frequency=float(frequency))
+        self._traj_ctrl = HighFreqController(
+            self._robot, self._gripper, frequency=float(frequency)
+        )
         self._traj_ctrl.start()
 
     def stop_trajectory_controller(self):
@@ -214,6 +220,20 @@ class FrankaRobot:
             self._traj_ctrl.stop()
             self._traj_ctrl.join(timeout=2.0)
             self._traj_ctrl = None
+
+    def get_state_history(self, n=100):
+        """Return (timestamps, joints_list, gripper_list) from the HighFreqController
+        state ring buffer.
+
+        Used by the GPU server to retrieve a high-frequency proprioception history
+        for UMI-style interpolation to the camera observation timestamp.
+
+        zerorpc-exposed: returns plain Python lists (no numpy) for msgpack compat.
+        Returns three empty lists if the trajectory controller is not running.
+        """
+        if self._traj_ctrl is None or not self._traj_ctrl.is_alive():
+            return [], [], []
+        return self._traj_ctrl.get_state_history(int(n))
 
     def add_waypoints(self, times_list, positions_list):
         """Send a batch of arm waypoints to the trajectory controller.

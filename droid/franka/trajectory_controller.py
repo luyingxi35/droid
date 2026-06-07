@@ -53,47 +53,99 @@ class JointTrajectoryInterpolator:
 class HighFreqController(threading.Thread):
     """200 Hz joint position controller that runs on the NUC.
 
-    Accesses polymetis.RobotInterface (gRPC localhost) directly — safe
-    because this thread runs on the NUC alongside the Polymetis server.
+    Accesses polymetis.RobotInterface and GripperInterface (both gRPC localhost)
+    directly — safe because this thread runs on the NUC alongside Polymetis.
+
+    Responsibilities:
+    1. Trajectory execution: interpolate waypoints at 200 Hz and send
+       update_desired_joint_positions() to the arm.
+    2. State history: record (timestamp, joint_positions_7d, gripper_pos_norm)
+       at each tick into a ring buffer so the GPU-server can retrieve a
+       high-frequency history for UMI-style proprioception interpolation.
 
     Prerequisites (must be done before calling start()):
         FrankaRobot.update_joints(current_joints, velocity=False, blocking=False)
-    This triggers DROID's impedance controller startup so Polymetis is ready
-    to accept continuous position targets via update_desired_joint_positions.
-
-    The controller runs independently at high frequency.  The GPU-server policy
-    loop calls add_waypoints() at ~10 Hz; the controller interpolates between
-    those waypoints smoothly at 200 Hz.
+    This triggers DROID's impedance controller startup so Polymetis accepts
+    continuous position targets.
     """
 
-    def __init__(self, polymetis_robot, frequency: float = 200.0) -> None:
+    STATE_HISTORY_LEN = 400  # 400 entries @ 200 Hz = 2 s of history
+
+    def __init__(
+        self,
+        polymetis_robot,    # polymetis.RobotInterface  (gRPC localhost, thread-safe)
+        polymetis_gripper,  # polymetis.GripperInterface (gRPC localhost, thread-safe)
+        frequency: float = 200.0,
+    ) -> None:
         super().__init__(daemon=True, name="HighFreqController")
-        self._robot = polymetis_robot  # polymetis.RobotInterface (gRPC localhost)
+        self._robot   = polymetis_robot
+        self._gripper = polymetis_gripper
         self._dt = 1.0 / frequency
+        # ── Trajectory interpolator (arm waypoints) ───────────────────────────
         self._interp = JointTrajectoryInterpolator()
         self._lock = threading.Lock()
+        # ── State ring buffer ─────────────────────────────────────────────────
+        # Each entry: [timestamp_s, j0, j1, j2, j3, j4, j5, j6, gripper_norm]
+        # gripper_norm = 1 - (width / max_width)  [0=open, 1=closed]
+        # matches FrankaRobot.get_gripper_position() convention.
+        self._state_buf: list[list[float]] = []
+        self._state_lock = threading.Lock()
+        self._max_gripper_width: float = 1.0  # overwritten in run() from metadata
         self._stop_event = threading.Event()
 
+    # ── Waypoint scheduling ────────────────────────────────────────────────────
+
     def add_waypoints(self, times: np.ndarray, positions: np.ndarray) -> None:
-        """Replace the current trajectory with a new batch of waypoints.
+        """Replace the current arm trajectory with a new batch of waypoints.
 
         Non-blocking, thread-safe.
 
         Args:
-            times: (N,) float64 wall-clock target times (time.time() seconds).
-                   Already adjusted for robot_action_latency by the caller.
+            times: (N,) float64 wall-clock target times (time.time() seconds),
+                   already adjusted for robot_action_latency by the caller.
             positions: (N, 7) float64 absolute joint angles in radians.
         """
         with self._lock:
             self._interp.set_waypoints(times, positions)
 
+    # ── State history access ───────────────────────────────────────────────────
+
+    def get_state_history(self, n: int = 100) -> tuple[list, list, list]:
+        """Return the last n state records as three parallel lists.
+
+        Thread-safe.  Called by FrankaRobot.get_state_history() which is
+        zerorpc-exposed, so all values must be plain Python types (no numpy).
+
+        Returns:
+            times:   list[float]       — wall-clock timestamps (seconds)
+            joints:  list[list[float]] — 7-DOF joint positions (radians)
+            gripper: list[float]       — normalized gripper position [0=open, 1=closed]
+        """
+        with self._state_lock:
+            recent = self._state_buf[-n:] if len(self._state_buf) >= n else list(self._state_buf)
+        times   = [s[0]   for s in recent]
+        joints  = [s[1:8] for s in recent]
+        gripper = [s[8]   for s in recent]
+        return times, joints, gripper
+
+    # ── Controller stop ────────────────────────────────────────────────────────
+
     def stop(self) -> None:
         """Signal the controller loop to exit."""
         self._stop_event.set()
 
+    # ── Main loop ──────────────────────────────────────────────────────────────
+
     def run(self) -> None:
         import grpc
         import torch
+
+        # Read max gripper width once from Polymetis metadata (fast gRPC call).
+        try:
+            self._max_gripper_width = float(self._gripper.metadata.max_width)
+        except Exception:
+            logging.warning("HighFreqController: could not read gripper metadata; "
+                            "gripper normalization will use default max_width=1.0")
 
         t_start = time.time()
         iter_idx = 0
@@ -101,6 +153,25 @@ class HighFreqController(threading.Thread):
         while not self._stop_event.is_set():
             t_now = time.time()
 
+            # ── 1. Read current robot state into ring buffer ───────────────────
+            joints_list       = [-1.0] * 7
+            gripper_norm      = -1.0
+            try:
+                joints_list = self._robot.get_joint_positions().numpy().tolist()
+            except Exception:
+                pass
+            try:
+                width       = self._gripper.get_state().width
+                gripper_norm = 1.0 - float(width) / self._max_gripper_width
+            except Exception:
+                pass
+
+            with self._state_lock:
+                self._state_buf.append([t_now] + joints_list + [gripper_norm])
+                if len(self._state_buf) > self.STATE_HISTORY_LEN:
+                    self._state_buf.pop(0)
+
+            # ── 2. Execute interpolated arm position target ────────────────────
             with self._lock:
                 joint_target = self._interp(t_now)
 
@@ -112,7 +183,8 @@ class HighFreqController(threading.Thread):
                 except grpc.RpcError:
                     pass  # transient gRPC error — skip this tick
                 except Exception:
-                    logging.exception("HighFreqController: unexpected error in update_desired_joint_positions")
+                    logging.exception("HighFreqController: unexpected error in "
+                                      "update_desired_joint_positions")
 
             iter_idx += 1
             sleep_s = t_start + iter_idx * self._dt - time.time()
