@@ -38,6 +38,7 @@ class FrankaRobot:
         self._max_gripper_width = self._gripper.metadata.max_width
         self._ik_solver = RobotIKSolver()
         self._controller_not_loaded = False
+        self._traj_ctrl = None  # HighFreqController instance (set by start_trajectory_controller)
 
     def kill_controller(self):
         self._robot_process.kill()
@@ -187,6 +188,53 @@ class FrankaRobot:
         time_to_go = self._robot._adaptive_time_to_go(displacement)
         clamped_time_to_go = min(t_max, max(time_to_go, t_min))
         return clamped_time_to_go
+
+    # ── High-frequency trajectory controller ──────────────────────────────────
+
+    def start_trajectory_controller(self, frequency=200.0):
+        """Start the high-frequency joint position controller on the NUC.
+
+        Must be called AFTER update_joints(..., blocking=False) has been invoked
+        at least once to ensure the Polymetis impedance controller is active.
+
+        zerorpc-exposed: called by GPU-server via ServerInterface.
+        """
+        from droid.franka.trajectory_controller import HighFreqController
+        if self._traj_ctrl is not None and self._traj_ctrl.is_alive():
+            return  # already running
+        self._traj_ctrl = HighFreqController(self._robot, frequency=float(frequency))
+        self._traj_ctrl.start()
+
+    def stop_trajectory_controller(self):
+        """Stop the high-frequency controller. Called at episode end.
+
+        zerorpc-exposed: called by GPU-server via ServerInterface.
+        """
+        if self._traj_ctrl is not None:
+            self._traj_ctrl.stop()
+            self._traj_ctrl.join(timeout=2.0)
+            self._traj_ctrl = None
+
+    def add_waypoints(self, times_list, positions_list):
+        """Send a batch of arm waypoints to the trajectory controller.
+
+        Args:
+            times_list: list[float] — wall-clock target times (time.time()).
+                        Already compensated for robot_action_latency by caller.
+            positions_list: list[list[float]] — shape (N, 7), absolute joint angles.
+
+        zerorpc-exposed: called ~10 Hz from GPU-server policy loop.
+        Lists are used (not numpy) because msgpack serialises them natively.
+        """
+        if self._traj_ctrl is None or not self._traj_ctrl.is_alive():
+            raise RuntimeError(
+                "Trajectory controller not running. "
+                "Call start_trajectory_controller() first."
+            )
+        self._traj_ctrl.add_waypoints(
+            np.array(times_list, dtype=np.float64),
+            np.array(positions_list, dtype=np.float64),
+        )
 
     def create_action_dict(self, action, action_space, gripper_action_space=None, robot_state=None):
         assert action_space in ["cartesian_position", "joint_position", "cartesian_velocity", "joint_velocity"]

@@ -75,3 +75,22 @@ class ServerInterface:
 
     def get_robot_state(self):
         return self.server.get_robot_state()
+
+    # ── High-frequency trajectory controller ──────────────────────────────────
+
+    def start_trajectory_controller(self, frequency=200.0):
+        """Start the 200 Hz joint position controller on the NUC server."""
+        self.server.start_trajectory_controller(float(frequency))
+
+    def stop_trajectory_controller(self):
+        """Stop the high-frequency controller on the NUC server."""
+        self.server.stop_trajectory_controller()
+
+    def add_waypoints(self, times_list, positions_list):
+        """Send a waypoint batch to the NUC trajectory controller.
+
+        Args:
+            times_list: list[float] — wall-clock target times (time.time()).
+            positions_list: list[list[float]] — shape (N, 7), joint angles.
+        """
+        self.server.add_waypoints(times_list, positions_list)
