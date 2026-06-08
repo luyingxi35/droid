@@ -1,6 +1,7 @@
 # ROBOT SPECIFIC IMPORTS
 import os
 import time
+import logging
 
 import grpc
 import numpy as np
@@ -13,6 +14,10 @@ from droid.misc.subprocess_utils import run_terminal_command, run_threaded_comma
 # UTILITY SPECIFIC IMPORTS
 from droid.misc.transformations import add_poses, euler_to_quat, pose_diff, quat_to_euler
 from droid.robot_ik.robot_ik_solver import RobotIKSolver
+
+DEFAULT_FRANKA_GRIPPER_MAX_WIDTH = 0.085
+
+
 
 
 class FrankaRobot:
@@ -32,10 +37,20 @@ class FrankaRobot:
         self._server_launched = True
         time.sleep(5)
 
+    def get_gripper_max_width(gripper, default=DEFAULT_FRANKA_GRIPPER_MAX_WIDTH):
+        metadata = getattr(gripper, "metadata", None)
+        max_width = getattr(metadata, "max_width", None)
+        if max_width is None:
+            logging.warning(
+                "Franka gripper metadata unavailable; using fallback max_width=%.3f m", DEFAULT_FRANKA_GRIPPER_MAX_WIDTH)
+            max_width = DEFAULT_FRANKA_GRIPPER_MAX_WIDTH
+        return max_width
+
+
     def launch_robot(self):
         self._robot = RobotInterface(ip_address="localhost")
         self._gripper = GripperInterface(ip_address="localhost")
-        self._max_gripper_width = self._gripper.metadata.max_width
+        self._max_gripper_width = self.get_gripper_max_width(self._gripper)
         self._ik_solver = RobotIKSolver()
         self._controller_not_loaded = False
         self._traj_ctrl = None  # HighFreqController instance (set by start_trajectory_controller)
