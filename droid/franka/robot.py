@@ -102,12 +102,12 @@ class FrankaRobot:
         def helper_non_blocking():
             if not self._robot.is_running_policy():
                 self._controller_not_loaded = True
-                self._robot.start_cartesian_impedance()
+                self._robot.start_joint_impedance()
                 timeout = time.time() + 5
                 while not self._robot.is_running_policy():
                     time.sleep(0.01)
                     if time.time() > timeout:
-                        self._robot.start_cartesian_impedance()
+                        self._robot.start_joint_impedance()
                         timeout = time.time() + 5
 
                 self._controller_not_loaded = False

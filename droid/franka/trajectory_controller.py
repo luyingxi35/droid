@@ -45,7 +45,7 @@ class JointTrajectoryInterpolator:
         times: np.ndarray,
         positions: np.ndarray,
         curr_time: float,
-        max_joint_speed_rad_s: float = 3.0,
+        max_joint_speed_rad_s: float = 0.1,
     ) -> None:
         """Replace trajectory, preserving C0 continuity from the current execution point.
 
