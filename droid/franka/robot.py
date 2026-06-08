@@ -209,18 +209,29 @@ class FrankaRobot:
     def start_trajectory_controller(self, frequency=200.0):
         """Start the high-frequency joint position + state-logging controller.
 
-        Must be called AFTER update_joints(..., blocking=False) has been invoked
-        at least once to ensure the Polymetis impedance controller is active.
-
-        Passes both self._robot (RobotInterface) and self._gripper (GripperInterface)
-        so the controller can log arm + gripper state at 200 Hz for UMI-style
-        proprioception interpolation on the GPU server.
+        Explicitly switches Polymetis to joint impedance before spawning
+        HighFreqController.  The warm-up update_joints(blocking=False) starts
+        cartesian impedance, but update_desired_joint_positions() requires joint
+        impedance — these are different controllers in Polymetis.
 
         zerorpc-exposed: called by GPU-server via ServerInterface.
         """
         from droid.franka.trajectory_controller import HighFreqController
         if self._traj_ctrl is not None and self._traj_ctrl.is_alive():
             return  # already running
+
+        # Switch to joint impedance.  terminate first if another policy is active.
+        if self._robot.is_running_policy():
+            self._robot.terminate_current_policy()
+        self._robot.start_joint_impedance()
+        deadline = time.time() + 3.0
+        while not self._robot.is_running_policy():
+            time.sleep(0.01)
+            if time.time() > deadline:
+                raise RuntimeError(
+                    "Timed out waiting for joint impedance controller to start"
+                )
+
         self._traj_ctrl = HighFreqController(
             self._robot, self._gripper, frequency=float(frequency)
         )
@@ -235,6 +246,13 @@ class FrankaRobot:
             self._traj_ctrl.stop()
             self._traj_ctrl.join(timeout=2.0)
             self._traj_ctrl = None
+        # Terminate any active Polymetis policy so the subsequent blocking reset
+        # (update_joints blocking=True → move_to_joint_positions) starts clean.
+        try:
+            if self._robot.is_running_policy():
+                self._robot.terminate_current_policy()
+        except grpc.RpcError:
+            pass
 
     def get_state_history(self, n=100):
         """Return (timestamps, joints_list, gripper_list) from the HighFreqController
