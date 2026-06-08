@@ -53,6 +53,7 @@ class FrankaRobot:
         self._max_gripper_width = self.get_gripper_max_width(self._gripper)
         self._ik_solver = RobotIKSolver()
         self._controller_not_loaded = False
+        self._joint_impedance_active = False  # True only when joint impedance is the active Polymetis controller
         self._traj_ctrl = None  # HighFreqController instance (set by start_trajectory_controller)
 
     def kill_controller(self):
@@ -100,8 +101,13 @@ class FrankaRobot:
             command = joint_delta + self._robot.get_joint_positions()
 
         def helper_non_blocking():
-            if not self._robot.is_running_policy():
+            # Ensure joint impedance is active.  update_desired_joint_positions()
+            # requires joint impedance; cartesian impedance (started after blocking
+            # moves at line 128) will cause Polymetis to reject the call.
+            if not self._robot.is_running_policy() or not self._joint_impedance_active:
                 self._controller_not_loaded = True
+                if self._robot.is_running_policy():
+                    self._robot.terminate_current_policy()
                 self._robot.start_joint_impedance()
                 timeout = time.time() + 5
                 while not self._robot.is_running_policy():
@@ -110,6 +116,7 @@ class FrankaRobot:
                         self._robot.start_joint_impedance()
                         timeout = time.time() + 5
 
+                self._joint_impedance_active = True
                 self._controller_not_loaded = False
             try:
                 self._robot.update_desired_joint_positions(command)
@@ -126,6 +133,7 @@ class FrankaRobot:
                 pass
 
             self._robot.start_cartesian_impedance()
+            self._joint_impedance_active = False
         else:
             if not self._controller_not_loaded:
                 run_threaded_command(helper_non_blocking)
@@ -223,6 +231,7 @@ class FrankaRobot:
         # Switch to joint impedance.  terminate first if another policy is active.
         if self._robot.is_running_policy():
             self._robot.terminate_current_policy()
+        self._joint_impedance_active = False
         self._robot.start_joint_impedance()
         deadline = time.time() + 3.0
         while not self._robot.is_running_policy():
@@ -231,6 +240,7 @@ class FrankaRobot:
                 raise RuntimeError(
                     "Timed out waiting for joint impedance controller to start"
                 )
+        self._joint_impedance_active = True
 
         self._traj_ctrl = HighFreqController(
             self._robot, self._gripper, frequency=float(frequency)
@@ -253,6 +263,7 @@ class FrankaRobot:
                 self._robot.terminate_current_policy()
         except grpc.RpcError:
             pass
+        self._joint_impedance_active = False
 
     def get_state_history(self, n=100):
         """Return (timestamps, joints_list, gripper_list) from the HighFreqController
