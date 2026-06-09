@@ -45,7 +45,7 @@ class JointTrajectoryInterpolator:
         times: np.ndarray,
         positions: np.ndarray,
         curr_time: float,
-        max_joint_speed_rad_s: float = 0.1,
+        max_joint_speed_rad_s: float = 0.5,
     ) -> None:
         """Replace trajectory, preserving C0 continuity from the current execution point.
 
@@ -177,7 +177,12 @@ class HighFreqController(threading.Thread):
 
     # ── Waypoint scheduling ────────────────────────────────────────────────────
 
-    def add_waypoints(self, times: np.ndarray, positions: np.ndarray) -> None:
+    def add_waypoints(
+        self,
+        times: np.ndarray,
+        positions: np.ndarray,
+        max_joint_speed_rad_s: float = 0.5,
+    ) -> None:
         """Replace the current arm trajectory with a new batch of waypoints.
 
         Non-blocking, thread-safe.
@@ -194,6 +199,10 @@ class HighFreqController(threading.Thread):
                    Negative values are waypoints already in the past;
                    positive values are future targets.
             positions: (N, 7) float64 absolute joint angles in radians.
+            max_joint_speed_rad_s: per-joint speed cap (rad/s). Default 0.5
+                (conservative safety limit). Pass a higher value (e.g. 3.0) via
+                CLI config to allow faster execution. Forwarded to
+                update_waypoints() speed-cap logic.
         """
         # Convert relative offsets → NUC monotonic times.
         # Network latency (~5 ms) shifts all offsets slightly toward the past;
@@ -204,6 +213,7 @@ class HighFreqController(threading.Thread):
                 mono_times,
                 np.asarray(positions, dtype=np.float64),
                 curr_time=time.monotonic(),
+                max_joint_speed_rad_s=max_joint_speed_rad_s,
             )
 
     # ── State history access ───────────────────────────────────────────────────

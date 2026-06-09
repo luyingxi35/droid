@@ -279,16 +279,19 @@ class FrankaRobot:
             return [], [], []
         return self._traj_ctrl.get_state_history(int(n))
 
-    def add_waypoints(self, times_list, positions_list):
+    def add_waypoints(self, times_list, positions_list, max_joint_speed_rad_s=0.5):
         """Send a batch of arm waypoints to the trajectory controller.
 
         Args:
-            times_list: list[float] — wall-clock target times (time.time()).
-                        Already compensated for robot_action_latency by caller.
+            times_list: list[float] — time offsets from caller's time.time(),
+                        already compensated for robot_action_latency by caller.
             positions_list: list[list[float]] — shape (N, 7), absolute joint angles.
+            max_joint_speed_rad_s: per-joint speed cap (rad/s). Default 0.5
+                (conservative). Pass a higher value (e.g. 3.0) via CLI config
+                for faster execution. Forwarded to HighFreqController.
 
         zerorpc-exposed: called ~10 Hz from GPU-server policy loop.
-        Lists are used (not numpy) because msgpack serialises them natively.
+        Lists and float are used (not numpy) because msgpack serialises them natively.
         """
         if self._traj_ctrl is None or not self._traj_ctrl.is_alive():
             raise RuntimeError(
@@ -298,6 +301,7 @@ class FrankaRobot:
         self._traj_ctrl.add_waypoints(
             np.array(times_list, dtype=np.float64),
             np.array(positions_list, dtype=np.float64),
+            max_joint_speed_rad_s=float(max_joint_speed_rad_s),
         )
 
     def create_action_dict(self, action, action_space, gripper_action_space=None, robot_state=None):
