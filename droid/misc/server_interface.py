@@ -87,6 +87,10 @@ class ServerInterface:
         """
         return self.server.get_state_history(int(n))
 
+    def prepare_for_streaming(self, timeout_s=5.0):
+        """Synchronously prepare the NUC-side robot for joint-target streaming."""
+        self.server.prepare_for_streaming(float(timeout_s))
+
     def start_trajectory_controller(self, frequency=200.0):
         """Start the 200 Hz joint position controller on the NUC server."""
         self.server.start_trajectory_controller(float(frequency))
@@ -95,11 +99,16 @@ class ServerInterface:
         """Stop the high-frequency controller on the NUC server."""
         self.server.stop_trajectory_controller()
 
-    def add_waypoints(self, times_list, positions_list):
+    def add_waypoints(self, times_list, positions_list, max_joint_speed_rad_s=0.5):
         """Send a waypoint batch to the NUC trajectory controller.
 
         Args:
-            times_list: list[float] — wall-clock target times (time.time()).
+            times_list: list[float] — time offsets from the caller's current time.
             positions_list: list[list[float]] — shape (N, 7), joint angles.
+            max_joint_speed_rad_s: per-joint speed cap forwarded to the NUC.
         """
-        self.server.add_waypoints(times_list, positions_list)
+        self.server.add_waypoints(
+            times_list,
+            positions_list,
+            float(max_joint_speed_rad_s),
+        )

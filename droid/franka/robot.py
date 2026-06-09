@@ -2,6 +2,7 @@
 import os
 import time
 import logging
+import threading
 
 import grpc
 import numpy as np
@@ -22,17 +23,17 @@ DEFAULT_FRANKA_GRIPPER_MAX_WIDTH = 0.085
 
 class FrankaRobot:
     def launch_controller(self):
+        print("enter launch control")
         try:
             self.kill_controller()
         except:
             pass
-
-        dir_path = os.path.dirname(os.path.realpath(__file__))
-        self._robot_process = run_terminal_command(
-            "echo " + sudo_password + " | sudo -S " + "bash " + dir_path + "/launch_robot.sh"
-        )
+        dir_path = os.path.dirname(os.path.realpath(__file__))        
         self._gripper_process = run_terminal_command(
             "echo " + sudo_password + " | sudo -S " + "bash " + dir_path + "/launch_gripper.sh"
+        )
+        self._robot_process = run_terminal_command(
+            "echo " + sudo_password + " | sudo -S " + "bash " + dir_path + "/launch_robot.sh"
         )
         self._server_launched = True
         time.sleep(5)
@@ -55,6 +56,7 @@ class FrankaRobot:
         self._controller_not_loaded = False
         self._joint_impedance_active = False  # True only when joint impedance is the active Polymetis controller
         self._traj_ctrl = None  # HighFreqController instance (set by start_trajectory_controller)
+        self._controller_lock = threading.RLock()
 
     def kill_controller(self):
         self._robot_process.kill()
@@ -91,6 +93,86 @@ class FrankaRobot:
 
             self.update_joints(joint_velocity, velocity=True, blocking=False)
 
+    def _assert_no_trajectory_controller_locked(self, action):
+        if self._traj_ctrl is not None and self._traj_ctrl.is_alive():
+            raise RuntimeError(
+                f"Cannot {action} while the high-frequency trajectory controller is running."
+            )
+
+    def _wait_for_running_policy_locked(self, timeout_s=5.0, context="controller"):
+        deadline = time.time() + timeout_s
+        while not self._robot.is_running_policy():
+            if time.time() > deadline:
+                raise RuntimeError(f"Timed out waiting for {context} to start.")
+            time.sleep(0.01)
+
+    def _terminate_active_policy_locked(self, reason):
+        if self._robot.is_running_policy():
+            logging.info("Terminating active Polymetis policy (%s).", reason)
+            self._robot.terminate_current_policy()
+        self._joint_impedance_active = False
+
+    def _probe_joint_impedance_locked(self, desired_joints=None):
+        if desired_joints is None:
+            desired_joints = self._robot.get_joint_positions()
+        if not torch.is_tensor(desired_joints):
+            desired_joints = torch.Tensor(desired_joints)
+        self._robot.update_desired_joint_positions(desired_joints)
+
+    def _ensure_joint_impedance_ready_locked(self, probe_joint_positions=None, timeout_s=5.0):
+        policy_running = self._robot.is_running_policy()
+        if (not policy_running) or (not self._joint_impedance_active):
+            self._controller_not_loaded = True
+            self._terminate_active_policy_locked("preparing for joint-target streaming")
+            logging.info("Starting joint impedance controller.")
+            self._robot.start_joint_impedance()
+            self._wait_for_running_policy_locked(
+                timeout_s=timeout_s,
+                context="joint impedance controller",
+            )
+
+        try:
+            self._probe_joint_impedance_locked(desired_joints=probe_joint_positions)
+        except grpc.RpcError as exc:
+            self._joint_impedance_active = False
+            raise RuntimeError(
+                "Joint impedance probe failed. Polymetis rejected desired joint positions."
+            ) from exc
+
+        self._joint_impedance_active = True
+        self._controller_not_loaded = False
+
+    def _stop_trajectory_controller_locked(self, join_timeout_s=2.0):
+        if self._traj_ctrl is not None:
+            if self._traj_ctrl.is_alive():
+                self._traj_ctrl.stop()
+                self._traj_ctrl.join(timeout=join_timeout_s)
+                if self._traj_ctrl.is_alive():
+                    raise RuntimeError(
+                        "Timed out waiting for the high-frequency trajectory controller to stop."
+                    )
+            self._traj_ctrl = None
+
+        self._terminate_active_policy_locked("stopping trajectory controller")
+        self._controller_not_loaded = False
+
+    def prepare_for_streaming(self, timeout_s=5.0):
+        """Synchronously prepare Polymetis for joint-target streaming.
+
+        Stops any stale trajectory controller, clears old policies, starts joint
+        impedance, and probes that update_desired_joint_positions() is accepted.
+
+        zerorpc-exposed: called by GPU-server via ServerInterface.
+        """
+        with self._controller_lock:
+            if self._traj_ctrl is not None:
+                self._stop_trajectory_controller_locked()
+            current_joints = self._robot.get_joint_positions()
+            self._ensure_joint_impedance_ready_locked(
+                probe_joint_positions=current_joints,
+                timeout_s=timeout_s,
+            )
+
     def update_joints(self, command, velocity=False, blocking=False, cartesian_noise=None):
         if cartesian_noise is not None:
             command = self.add_noise_to_joints(command, cartesian_noise)
@@ -101,39 +183,46 @@ class FrankaRobot:
             command = joint_delta + self._robot.get_joint_positions()
 
         def helper_non_blocking():
-            # Ensure joint impedance is active.  update_desired_joint_positions()
-            # requires joint impedance; cartesian impedance (started after blocking
-            # moves at line 128) will cause Polymetis to reject the call.
-            if not self._robot.is_running_policy() or not self._joint_impedance_active:
-                self._controller_not_loaded = True
-                if self._robot.is_running_policy():
-                    self._robot.terminate_current_policy()
-                self._robot.start_joint_impedance()
-                timeout = time.time() + 5
-                while not self._robot.is_running_policy():
-                    time.sleep(0.01)
-                    if time.time() > timeout:
-                        self._robot.start_joint_impedance()
-                        timeout = time.time() + 5
-
-                self._joint_impedance_active = True
-                self._controller_not_loaded = False
             try:
-                self._robot.update_desired_joint_positions(command)
-            except grpc.RpcError:
-                pass
+                with self._controller_lock:
+                    self._assert_no_trajectory_controller_locked("send direct joint targets")
+                    policy_running = self._robot.is_running_policy()
+                    if (not policy_running) or (not self._joint_impedance_active):
+                        self._ensure_joint_impedance_ready_locked(
+                            probe_joint_positions=command,
+                        )
+                        return
+                    try:
+                        self._robot.update_desired_joint_positions(command)
+                    except grpc.RpcError:
+                        logging.warning(
+                            "Desired joint update rejected; restarting joint impedance controller."
+                        )
+                        self._joint_impedance_active = False
+                        self._ensure_joint_impedance_ready_locked(
+                            probe_joint_positions=command,
+                        )
+            except Exception:
+                logging.exception(
+                    "FrankaRobot.update_joints: failed to send non-blocking joint target"
+                )
+            finally:
+                self._controller_not_loaded = False
 
         if blocking:
-            if self._robot.is_running_policy():
-                self._robot.terminate_current_policy()
-            try:
-                time_to_go = self.adaptive_time_to_go(command)
-                self._robot.move_to_joint_positions(command, time_to_go=time_to_go)
-            except grpc.RpcError:
-                pass
-
-            self._robot.start_cartesian_impedance()
-            self._joint_impedance_active = False
+            with self._controller_lock:
+                self._assert_no_trajectory_controller_locked("run a blocking joint move")
+                self._terminate_active_policy_locked("starting blocking joint move")
+                try:
+                    time_to_go = self.adaptive_time_to_go(command)
+                    self._robot.move_to_joint_positions(command, time_to_go=time_to_go)
+                except grpc.RpcError as exc:
+                    raise RuntimeError(
+                        "Blocking joint move failed while moving to the requested target."
+                    ) from exc
+                finally:
+                    self._terminate_active_policy_locked("finishing blocking joint move")
+                    self._controller_not_loaded = False
         else:
             if not self._controller_not_loaded:
                 run_threaded_command(helper_non_blocking)
@@ -217,53 +306,31 @@ class FrankaRobot:
     def start_trajectory_controller(self, frequency=200.0):
         """Start the high-frequency joint position + state-logging controller.
 
-        Explicitly switches Polymetis to joint impedance before spawning
-        HighFreqController.  The warm-up update_joints(blocking=False) starts
-        cartesian impedance, but update_desired_joint_positions() requires joint
-        impedance — these are different controllers in Polymetis.
+        This method is self-sufficient: it synchronously prepares Polymetis for
+        joint-target streaming before spawning HighFreqController.
 
         zerorpc-exposed: called by GPU-server via ServerInterface.
         """
         from droid.franka.trajectory_controller import HighFreqController
-        if self._traj_ctrl is not None and self._traj_ctrl.is_alive():
-            return  # already running
+        with self._controller_lock:
+            if self._traj_ctrl is not None and self._traj_ctrl.is_alive():
+                return  # already running
+            if self._traj_ctrl is not None and not self._traj_ctrl.is_alive():
+                self._traj_ctrl = None
 
-        # Switch to joint impedance.  terminate first if another policy is active.
-        if self._robot.is_running_policy():
-            self._robot.terminate_current_policy()
-        self._joint_impedance_active = False
-        self._robot.start_joint_impedance()
-        deadline = time.time() + 3.0
-        while not self._robot.is_running_policy():
-            time.sleep(0.01)
-            if time.time() > deadline:
-                raise RuntimeError(
-                    "Timed out waiting for joint impedance controller to start"
-                )
-        self._joint_impedance_active = True
-
-        self._traj_ctrl = HighFreqController(
-            self._robot, self._gripper, frequency=float(frequency)
-        )
-        self._traj_ctrl.start()
+            self.prepare_for_streaming()
+            self._traj_ctrl = HighFreqController(
+                self._robot, self._gripper, frequency=float(frequency)
+            )
+            self._traj_ctrl.start()
 
     def stop_trajectory_controller(self):
         """Stop the high-frequency controller. Called at episode end.
 
         zerorpc-exposed: called by GPU-server via ServerInterface.
         """
-        if self._traj_ctrl is not None:
-            self._traj_ctrl.stop()
-            self._traj_ctrl.join(timeout=2.0)
-            self._traj_ctrl = None
-        # Terminate any active Polymetis policy so the subsequent blocking reset
-        # (update_joints blocking=True → move_to_joint_positions) starts clean.
-        try:
-            if self._robot.is_running_policy():
-                self._robot.terminate_current_policy()
-        except grpc.RpcError:
-            pass
-        self._joint_impedance_active = False
+        with self._controller_lock:
+            self._stop_trajectory_controller_locked()
 
     def get_state_history(self, n=100):
         """Return (timestamps, joints_list, gripper_list) from the HighFreqController
