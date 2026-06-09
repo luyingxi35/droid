@@ -7,7 +7,7 @@ robot_ip = "172.16.0.2"
 laptop_ip = ""
 sudo_password = "123456"
 robot_type = "fr3"  # 'panda' or 'fr3'
-robot_serial_number = ""
+robot_serial_number = "295341-2600346"
 
 # Camera ID's #
 hand_camera_id = ""
