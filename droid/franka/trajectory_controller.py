@@ -174,6 +174,7 @@ class HighFreqController(threading.Thread):
         self._state_lock = threading.Lock()
         self._max_gripper_width: float = 1.0  # overwritten in run() from metadata
         self._stop_event = threading.Event()
+        self._consecutive_joint_update_failures = 0
 
     # ── Waypoint scheduling ────────────────────────────────────────────────────
 
@@ -294,11 +295,26 @@ class HighFreqController(threading.Thread):
                     self._robot.update_desired_joint_positions(
                         torch.tensor(joint_target, dtype=torch.float32)
                     )
+                    self._consecutive_joint_update_failures = 0
                 except grpc.RpcError:
-                    pass  # transient gRPC error — skip this tick
+                    self._consecutive_joint_update_failures += 1
+                    if self._consecutive_joint_update_failures == 1:
+                        logging.warning(
+                            "HighFreqController: desired joint update rejected by Polymetis."
+                        )
+                    elif self._consecutive_joint_update_failures >= 20:
+                        logging.error(
+                            "HighFreqController: %d consecutive desired joint update failures; "
+                            "stopping controller thread.",
+                            self._consecutive_joint_update_failures,
+                        )
+                        self._stop_event.set()
                 except Exception:
+                    self._consecutive_joint_update_failures += 1
                     logging.exception("HighFreqController: unexpected error in "
                                       "update_desired_joint_positions")
+                    if self._consecutive_joint_update_failures >= 20:
+                        self._stop_event.set()
 
             iter_idx += 1
             sleep_s = t_start + iter_idx * self._dt - time.monotonic()
