@@ -20,14 +20,37 @@ def attempt_n_times(function_list, max_attempts, sleep_time=0.1):
                 time.sleep(sleep_time)
 
 
+def retry_on_exception(function, max_attempts, sleep_time=0.1, exception_types=(Exception,)):
+    for i in range(max_attempts):
+        try:
+            return function()
+        except exception_types:
+            last_attempt = i == (max_attempts - 1)
+            if last_attempt:
+                raise
+            time.sleep(sleep_time)
+
+
 class ServerInterface:
     def __init__(self, ip_address="127.0.0.1", launch=True):
         self.ip_address = ip_address
         self.establish_connection()
 
         if launch:
-            func_list = [self.launch_controller, self.launch_robot]
-            attempt_n_times(func_list, max_attempts=2)
+            self.launch_controller()
+            try:
+                retry_on_exception(
+                    self.launch_robot,
+                    max_attempts=2,
+                    sleep_time=0.5,
+                    exception_types=(zerorpc.exceptions.RemoteError, RuntimeError),
+                )
+            except Exception:
+                try:
+                    self.kill_controller()
+                except zerorpc.exceptions.RemoteError:
+                    pass
+                raise
 
     def establish_connection(self):
         self.server = zerorpc.Client(heartbeat=20)

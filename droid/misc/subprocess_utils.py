@@ -3,9 +3,16 @@ import subprocess
 import threading
 
 
-def run_terminal_command(command):
+def run_terminal_command(command, stdout=None, stderr=None, start_new_session=False):
     process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stdin=subprocess.PIPE, shell=True, executable="/bin/bash", encoding="utf8"
+        command,
+        stdout=stdout,
+        stderr=stderr,
+        stdin=subprocess.DEVNULL,
+        shell=True,
+        executable="/bin/bash",
+        encoding="utf8",
+        start_new_session=start_new_session,
     )
 
     return process

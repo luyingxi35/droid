@@ -1,7 +1,10 @@
 # ROBOT SPECIFIC IMPORTS
 import os
 import time
+import socket
+import signal
 import logging
+import subprocess
 import threading
 
 import grpc
@@ -17,26 +20,137 @@ from droid.misc.transformations import add_poses, euler_to_quat, pose_diff, quat
 from droid.robot_ik.robot_ik_solver import RobotIKSolver
 
 DEFAULT_FRANKA_GRIPPER_MAX_WIDTH = 0.085
+CONTROLLER_STARTUP_TIMEOUT_S = 20.0
+PROCESS_SHUTDOWN_TIMEOUT_S = 5.0
 
 
 
 
 class FrankaRobot:
-    def launch_controller(self):
-        print("enter launch control")
+    def __init__(self):
+        self._gripper_process = None
+        self._robot_process = None
+        self._server_launched = False
+        self._robot = None
+        self._gripper = None
+        self._max_gripper_width = DEFAULT_FRANKA_GRIPPER_MAX_WIDTH
+        self._ik_solver = None
+        self._controller_not_loaded = False
+        self._joint_impedance_active = False
+        self._traj_ctrl = None
+        self._controller_lock = threading.RLock()
+
+    def _is_process_running(self, process):
+        return process is not None and process.poll() is None
+
+    def _describe_process_state(self, process, name):
+        if process is None:
+            return f"{name} has not been started."
+        returncode = process.poll()
+        if returncode is None:
+            return f"{name} is still running."
+        if returncode < 0:
+            return f"{name} exited due to signal {-returncode}."
+        return f"{name} exited with return code {returncode}."
+
+    def _ensure_process_running(self, process, name):
+        if not self._is_process_running(process):
+            raise RuntimeError(self._describe_process_state(process, name))
+
+    def _wait_for_port(self, port, process, name, timeout_s):
+        deadline = time.time() + timeout_s
+        last_error = None
+        while time.time() < deadline:
+            self._ensure_process_running(process, name)
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    return
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.1)
+
+        message = f"Timed out waiting for {name} on port {port}."
+        if last_error is not None:
+            message = f"{message} Last error: {last_error}"
+        raise RuntimeError(message)
+
+    def _terminate_process(self, process, name, timeout_s=PROCESS_SHUTDOWN_TIMEOUT_S):
+        if process is None:
+            return
+        if not self._is_process_running(process):
+            return
+
+        pgid = None
         try:
-            self.kill_controller()
-        except:
+            pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
             pass
-        dir_path = os.path.dirname(os.path.realpath(__file__))        
+
+        try:
+            if pgid is not None:
+                subprocess.run(
+                    ["sudo", "-S", "kill", "-TERM", f"-{pgid}"],
+                    input=sudo_password + "\n",
+                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                process.terminate()
+            process.wait(timeout=timeout_s)
+            return
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+
+        try:
+            if pgid is not None:
+                subprocess.run(
+                    ["sudo", "-S", "kill", "-KILL", f"-{pgid}"],
+                    input=sudo_password + "\n",
+                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                process.kill()
+            process.wait(timeout=1.0)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            logging.warning("Failed to terminate %s cleanly.", name)
+
+    def launch_controller(self, startup_timeout_s=CONTROLLER_STARTUP_TIMEOUT_S):
+        print("enter launch control")
+        self.kill_controller()
+        dir_path = os.path.dirname(os.path.realpath(__file__))
         self._gripper_process = run_terminal_command(
-            "echo " + sudo_password + " | sudo -S " + "bash " + dir_path + "/launch_gripper.sh"
+            "echo " + sudo_password + " | sudo -S " + "bash " + dir_path + "/launch_gripper.sh",
+            start_new_session=True,
         )
-        self._robot_process = run_terminal_command(
-            "echo " + sudo_password + " | sudo -S " + "bash " + dir_path + "/launch_robot.sh"
-        )
-        self._server_launched = True
-        time.sleep(5)
+        try:
+            self._robot_process = run_terminal_command(
+                "echo " + sudo_password + " | sudo -S " + "bash " + dir_path + "/launch_robot.sh",
+                start_new_session=True,
+            )
+            self._wait_for_port(
+                port=50052,
+                process=self._gripper_process,
+                name="Polymetis gripper service",
+                timeout_s=startup_timeout_s,
+            )
+            self._wait_for_port(
+                port=50051,
+                process=self._robot_process,
+                name="Polymetis robot service",
+                timeout_s=startup_timeout_s,
+            )
+            time.sleep(0.5)
+            self._ensure_process_running(self._gripper_process, "Polymetis gripper service")
+            self._ensure_process_running(self._robot_process, "Polymetis robot service")
+            self._server_launched = True
+        except Exception:
+            self.kill_controller()
+            raise
 
     def get_gripper_max_width(gripper, default=DEFAULT_FRANKA_GRIPPER_MAX_WIDTH):
         metadata = getattr(gripper, "metadata", None)
@@ -48,19 +162,53 @@ class FrankaRobot:
         return max_width
 
 
-    def launch_robot(self):
-        self._robot = RobotInterface(ip_address="localhost")
-        self._gripper = GripperInterface(ip_address="localhost")
+    def launch_robot(self, connection_timeout_s=5.0):
+        self._ensure_process_running(self._robot_process, "Polymetis robot service")
+        self._ensure_process_running(self._gripper_process, "Polymetis gripper service")
+        self._wait_for_port(
+            port=50051,
+            process=self._robot_process,
+            name="Polymetis robot service",
+            timeout_s=connection_timeout_s,
+        )
+        self._wait_for_port(
+            port=50052,
+            process=self._gripper_process,
+            name="Polymetis gripper service",
+            timeout_s=connection_timeout_s,
+        )
+
+        try:
+            self._robot = RobotInterface(ip_address="localhost")
+            self._gripper = GripperInterface(ip_address="localhost")
+        except grpc.RpcError as exc:
+            robot_state = self._describe_process_state(self._robot_process, "Polymetis robot service")
+            gripper_state = self._describe_process_state(self._gripper_process, "Polymetis gripper service")
+            raise RuntimeError(
+                "Failed to connect to Polymetis interfaces. "
+                + robot_state
+                + " "
+                + gripper_state
+            ) from exc
+
         self._max_gripper_width = self.get_gripper_max_width(self._gripper)
-        self._ik_solver = RobotIKSolver()
+        if self._ik_solver is None:
+            self._ik_solver = RobotIKSolver()
         self._controller_not_loaded = False
         self._joint_impedance_active = False  # True only when joint impedance is the active Polymetis controller
         self._traj_ctrl = None  # HighFreqController instance (set by start_trajectory_controller)
-        self._controller_lock = threading.RLock()
 
     def kill_controller(self):
-        self._robot_process.kill()
-        self._gripper_process.kill()
+        self._terminate_process(self._robot_process, "Polymetis robot service")
+        self._terminate_process(self._gripper_process, "Polymetis gripper service")
+        self._robot_process = None
+        self._gripper_process = None
+        self._robot = None
+        self._gripper = None
+        self._server_launched = False
+        self._joint_impedance_active = False
+        self._controller_not_loaded = False
+        self._traj_ctrl = None
 
     def update_command(self, command, action_space="cartesian_velocity", gripper_action_space=None, blocking=False):
         action_dict = self.create_action_dict(command, action_space=action_space, gripper_action_space=gripper_action_space)

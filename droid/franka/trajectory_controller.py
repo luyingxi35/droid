@@ -16,6 +16,9 @@ import time
 import numpy as np
 
 
+DEFAULT_FRANKA_GRIPPER_MAX_WIDTH = 0.085
+
+
 class JointTrajectoryInterpolator:
     """Linear interpolator over (monotonic time, joint_positions_7d) waypoints.
 
@@ -172,7 +175,7 @@ class HighFreqController(threading.Thread):
         # matches FrankaRobot.get_gripper_position() convention.
         self._state_buf: list[list[float]] = []
         self._state_lock = threading.Lock()
-        self._max_gripper_width: float = 1.0  # overwritten in run() from metadata
+        self._max_gripper_width: float = DEFAULT_FRANKA_GRIPPER_MAX_WIDTH
         self._stop_event = threading.Event()
         self._consecutive_joint_update_failures = 0
 
@@ -251,10 +254,17 @@ class HighFreqController(threading.Thread):
 
         # Read max gripper width once from Polymetis metadata (fast gRPC call).
         try:
-            self._max_gripper_width = float(self._gripper.metadata.max_width)
+            metadata = getattr(self._gripper, "metadata", None)
+            max_width = getattr(metadata, "max_width", 0.0)
+            if max_width <= 0.0:
+                raise ValueError("gripper metadata max_width unavailable")
+            self._max_gripper_width = float(max_width)
         except Exception:
-            logging.warning("HighFreqController: could not read gripper metadata; "
-                            "gripper normalization will use default max_width=1.0")
+            logging.warning(
+                "HighFreqController: could not read gripper metadata; "
+                "gripper normalization will use default max_width=%.3f m",
+                DEFAULT_FRANKA_GRIPPER_MAX_WIDTH,
+            )
 
         # Use time.monotonic() for the control loop so NTP wall-clock
         # adjustments cannot corrupt inter-tick sleep timing.
