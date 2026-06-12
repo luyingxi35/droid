@@ -136,7 +136,7 @@ class JointTrajectoryInterpolator:
 
 
 class HighFreqController(threading.Thread):
-    """200 Hz joint position controller that runs on the NUC.
+    """Joint position controller that runs on the NUC.
 
     Accesses polymetis.RobotInterface and GripperInterface (both gRPC localhost)
     directly — safe because this thread runs on the NUC alongside Polymetis.
@@ -160,12 +160,14 @@ class HighFreqController(threading.Thread):
         self,
         polymetis_robot,    # polymetis.RobotInterface  (gRPC localhost, thread-safe)
         polymetis_gripper,  # polymetis.GripperInterface (gRPC localhost, thread-safe)
-        frequency: float = 200.0,
+        frequency: float = 100.0,
+        on_fatal_error=None,
     ) -> None:
         super().__init__(daemon=True, name="HighFreqController")
         self._robot   = polymetis_robot
         self._gripper = polymetis_gripper
         self._dt = 1.0 / frequency
+        self._frequency = float(frequency)
         # ── Trajectory interpolator (arm waypoints) ───────────────────────────
         self._interp = JointTrajectoryInterpolator()
         self._lock = threading.Lock()
@@ -178,6 +180,8 @@ class HighFreqController(threading.Thread):
         self._max_gripper_width: float = DEFAULT_FRANKA_GRIPPER_MAX_WIDTH
         self._stop_event = threading.Event()
         self._consecutive_joint_update_failures = 0
+        self._fatal_error_reason = None
+        self._on_fatal_error = on_fatal_error
 
     # ── Waypoint scheduling ────────────────────────────────────────────────────
 
@@ -246,6 +250,23 @@ class HighFreqController(threading.Thread):
         """Signal the controller loop to exit."""
         self._stop_event.set()
 
+    def get_failure_reason(self):
+        return self._fatal_error_reason
+
+    def _record_fatal_error(self, reason: str) -> None:
+        if self._fatal_error_reason is not None:
+            return
+        self._fatal_error_reason = str(reason)
+        logging.error("HighFreqController: %s", self._fatal_error_reason)
+        self._stop_event.set()
+        if self._on_fatal_error is not None:
+            try:
+                self._on_fatal_error(self._fatal_error_reason)
+            except Exception:
+                logging.exception(
+                    "HighFreqController: failed to report fatal error to owner"
+                )
+
     # ── Main loop ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -312,19 +333,29 @@ class HighFreqController(threading.Thread):
                         logging.warning(
                             "HighFreqController: desired joint update rejected by Polymetis."
                         )
-                    elif self._consecutive_joint_update_failures >= 20:
-                        logging.error(
-                            "HighFreqController: %d consecutive desired joint update failures; "
-                            "stopping controller thread.",
-                            self._consecutive_joint_update_failures,
+                    try:
+                        policy_running = self._robot.is_running_policy()
+                    except Exception:
+                        policy_running = None
+                    if policy_running is False:
+                        self._record_fatal_error(
+                            "Polymetis joint-impedance controller is no longer running. "
+                            "This usually means a robot reflex or control interruption occurred; "
+                            "call start_trajectory_controller() again after recovery."
                         )
-                        self._stop_event.set()
+                    elif self._consecutive_joint_update_failures >= 5:
+                        self._record_fatal_error(
+                            "Desired joint updates were rejected repeatedly by Polymetis "
+                            f"at {self._frequency:.1f} Hz."
+                        )
                 except Exception:
                     self._consecutive_joint_update_failures += 1
                     logging.exception("HighFreqController: unexpected error in "
                                       "update_desired_joint_positions")
-                    if self._consecutive_joint_update_failures >= 20:
-                        self._stop_event.set()
+                    if self._consecutive_joint_update_failures >= 5:
+                        self._record_fatal_error(
+                            "Unexpected errors occurred repeatedly while sending desired joint positions."
+                        )
 
             iter_idx += 1
             sleep_s = t_start + iter_idx * self._dt - time.monotonic()

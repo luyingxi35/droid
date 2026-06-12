@@ -65,6 +65,12 @@ class ServerInterface:
     def kill_controller(self):
         self.server.kill_controller()
 
+    def get_controller_status(self):
+        return self.server.get_controller_status()
+
+    def preflight_check(self):
+        return self.server.preflight_check()
+
     def update_command(self, command, action_space="cartesian_velocity", gripper_action_space="velocity", blocking=False):
         action_dict = self.server.update_command(command.tolist(), action_space, gripper_action_space, blocking)
         return action_dict
@@ -105,7 +111,7 @@ class ServerInterface:
         """Return (timestamps, joints_list, gripper_list) from NUC's HighFreqController.
 
         Used for UMI-style proprioception interpolation: the GPU server calls this
-        at each 10 Hz tick to get a 200 Hz history of (arm, gripper) states, then
+        at each 10 Hz tick to get a high-rate history of (arm, gripper) states, then
         interpolates to the camera observation timestamp.
         """
         return self.server.get_state_history(int(n))
@@ -114,8 +120,8 @@ class ServerInterface:
         """Synchronously prepare the NUC-side robot for joint-target streaming."""
         self.server.prepare_for_streaming(float(timeout_s))
 
-    def start_trajectory_controller(self, frequency=200.0):
-        """Start the 200 Hz joint position controller on the NUC server."""
+    def start_trajectory_controller(self, frequency=100.0):
+        """Start the high-frequency joint position controller on the NUC server."""
         self.server.start_trajectory_controller(float(frequency))
 
     def stop_trajectory_controller(self):
